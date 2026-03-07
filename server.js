@@ -16,8 +16,10 @@ app.get('/', (req, res) => {
 
 // ESPN scoreboard endpoint
 // Usage: /scores?sport=basketball/nba
+// Usage: /scores?sport=basketball/nba&date=20250315  (specific date)
 app.get('/scores', async (req, res) => {
   const sport = req.query.sport || 'basketball/nba';
+  const date = req.query.date || '';
 
   // Whitelist allowed sports so nobody can abuse the endpoint
   const allowed = [
@@ -32,7 +34,9 @@ app.get('/scores', async (req, res) => {
   }
 
   try {
-    const url = `https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard`;
+    // If a date is provided, add it as a query param — ESPN accepts YYYYMMDD format
+    const dateParam = date ? `?dates=${date}` : '';
+    const url = `https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard${dateParam}`;
     const response = await fetch(url);
     const data = await response.json();
 
@@ -58,7 +62,8 @@ app.get('/scores', async (req, res) => {
         completed: comp.status?.type?.completed || false,
         inProgress: ['STATUS_IN_PROGRESS', 'STATUS_HALFTIME', 'STATUS_END_PERIOD']
           .includes(comp.status?.type?.name),
-        statusName: comp.status?.type?.name || ''
+        statusName: comp.status?.type?.name || '',
+        startTime: ev.date || ''
       };
     });
 
