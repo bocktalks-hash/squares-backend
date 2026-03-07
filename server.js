@@ -5,23 +5,21 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Allow requests from your GitHub Pages site
 app.use(cors());
 app.use(express.json());
 
-// Health check — visit this to confirm the server is running
 app.get('/', (req, res) => {
   res.json({ status: 'Squares backend is running!' });
 });
 
 // ESPN scoreboard endpoint
 // Usage: /scores?sport=basketball/nba
-// Usage: /scores?sport=basketball/nba&date=20250315  (specific date)
+// Usage: /scores?sport=basketball/nba&dates=20260308  (specific date)
 app.get('/scores', async (req, res) => {
   const sport = req.query.sport || 'basketball/nba';
-  const date = req.query.date || '';
+  // Accept both 'dates' and 'date' so either works
+  const date = req.query.dates || req.query.date || '';
 
-  // Whitelist allowed sports so nobody can abuse the endpoint
   const allowed = [
     'basketball/nba',
     'basketball/mens-college-basketball',
@@ -34,13 +32,12 @@ app.get('/scores', async (req, res) => {
   }
 
   try {
-    // If a date is provided, add it as a query param — ESPN accepts YYYYMMDD format
     const dateParam = date ? `?dates=${date}` : '';
     const url = `https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard${dateParam}`;
+    console.log('Fetching ESPN:', url);
     const response = await fetch(url);
     const data = await response.json();
 
-    // Pull out just what we need — keeps response small and fast
     const games = (data.events || []).map(ev => {
       const comp = ev.competitions[0];
       const home = comp.competitors.find(c => c.homeAway === 'home');
