@@ -143,7 +143,8 @@ app.post('/games', async (req, res) => {
     );
     res.json({ id, code, hostToken });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to create game' });
+    console.error('POST /games error:', err.message);
+    res.status(500).json({ error: 'Failed to create game', detail: err.message });
   }
 });
 
@@ -345,4 +346,76 @@ app.post('/games/:code/picks/claim', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Squares backend v2.1 running on port ${PORT}`));
+// ── Sessions ──────────────────────────────────────────────────────────────────
+async function ensureSessionTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id          TEXT PRIMARY KEY,
+      host_token  TEXT NOT NULL,
+      name        TEXT NOT NULL DEFAULT 'Game Day',
+      game_codes  TEXT[] NOT NULL DEFAULT '{}',
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+}
+ensureSessionTable().catch(e => console.error('Session table error:', e.message));
+
+app.post('/sessions', async (req, res) => {
+  try {
+    const { name = 'Game Day', gameCodes = [] } = req.body;
+    const id = makeCode();
+    const hostToken = makeToken();
+    await pool.query(
+      'INSERT INTO sessions (id, host_token, name, game_codes) VALUES ($1, $2, $3, $4)',
+      [id, hostToken, name, gameCodes]
+    );
+    res.json({ id, hostToken });
+  } catch (err) {
+    console.error('POST /sessions error:', err.message);
+    res.status(500).json({ error: 'Failed to create session', detail: err.message });
+  }
+});
+
+app.get('/sessions/:id', async (req, res) => {
+  try {
+    const sess = await pool.query('SELECT * FROM sessions WHERE id = $1', [req.params.id.toUpperCase()]);
+    if (!sess.rows.length) return res.status(404).json({ error: 'Session not found' });
+    const { id, name, game_codes, host_token, created_at } = sess.rows[0];
+    const games = [];
+    for (const code of game_codes) {
+      const g = await pool.query('SELECT type, code, data, updated_at FROM games WHERE code = $1', [code]);
+      if (g.rows.length) {
+        const { type, code: gcode, data, updated_at } = g.rows[0];
+        games.push({ type, code: gcode, data, updatedAt: updated_at });
+      }
+    }
+    const isHost = req.query.hostToken === host_token;
+    res.json({ id, name, games, createdAt: created_at, isHost });
+  } catch (err) {
+    console.error('GET /sessions error:', err.message);
+    res.status(500).json({ error: 'Failed to get session' });
+  }
+});
+
+app.put('/sessions/:id', async (req, res) => {
+  try {
+    const { hostToken, name, gameCodes } = req.body;
+    const sess = await pool.query('SELECT host_token FROM sessions WHERE id = $1', [req.params.id.toUpperCase()]);
+    if (!sess.rows.length) return res.status(404).json({ error: 'Not found' });
+    if (sess.rows[0].host_token !== hostToken) return res.status(403).json({ error: 'Not authorized' });
+    const fields = [];
+    const vals = [];
+    let i = 1;
+    if (name !== undefined) { fields.push(`name = $${i++}`); vals.push(name); }
+    if (gameCodes !== undefined) { fields.push(`game_codes = $${i++}`); vals.push(gameCodes); }
+    fields.push(`updated_at = NOW()`);
+    vals.push(req.params.id.toUpperCase());
+    await pool.query(`UPDATE sessions SET ${fields.join(', ')} WHERE id = $${i}`, vals);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update session' });
+  }
+});
+
+app.listen(PORT, () => console.log(`Squares backend v2.2 running on port ${PORT}`));
