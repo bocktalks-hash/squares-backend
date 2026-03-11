@@ -2,18 +2,94 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const { Pool } = require('pg');
+const compression = require('compression');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// ── In-memory ESPN cache ───────────────────────────────────────────────────────
+// Prevents 1000 clients from each hitting ESPN directly every 30s
+const espnCache = new Map(); // key -> { data, expiresAt }
+const SCORES_TTL   = 20 * 1000;  // 20 seconds — fast enough for live games
+const PBP_TTL      = 15 * 1000;  // 15 seconds for play-by-play
+
+function getCached(key) {
+  const entry = espnCache.get(key);
+  if (entry && Date.now() < entry.expiresAt) return entry.data;
+  return null;
+}
+function setCache(key, data, ttl) {
+  espnCache.set(key, { data, expiresAt: Date.now() + ttl });
+  // Prevent unbounded growth — evict old entries
+  if (espnCache.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of espnCache) {
+      if (now > v.expiresAt) espnCache.delete(k);
+    }
+  }
+}
+
+// ── Simple in-memory rate limiter ─────────────────────────────────────────────
+const rateLimitMap = new Map(); // ip -> { count, resetAt }
+function rateLimit(maxReqs, windowMs) {
+  return (req, res, next) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+    const now = Date.now();
+    const entry = rateLimitMap.get(ip);
+    if (!entry || now > entry.resetAt) {
+      rateLimitMap.set(ip, { count: 1, resetAt: now + windowMs });
+      return next();
+    }
+    entry.count++;
+    if (entry.count > maxReqs) {
+      return res.status(429).json({ error: 'Too many requests — slow down' });
+    }
+    next();
+  };
+}
+// Purge old rate limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitMap) {
+    if (now > v.resetAt) rateLimitMap.delete(k);
+  }
+}, 5 * 60 * 1000);
+
+// ── Allowed origins ───────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'https://bocktalks.app',
+  'https://www.bocktalks.app',
+  /\.vercel\.app$/,   // Vercel preview deployments
+  /localhost/,          // local dev
+];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // allow server-to-server / curl
+    const ok = ALLOWED_ORIGINS.some(o =>
+      typeof o === 'string' ? o === origin : o.test(origin)
+    );
+    cb(ok ? null : new Error('CORS blocked'), ok);
+  },
+  credentials: true,
+}));
+app.use(compression()); // gzip all responses
+app.use(express.json({ limit: '100kb' })); // cap payload size
+
+// Global rate limit: 300 requests per minute per IP
+app.use(rateLimit(300, 60 * 1000));
 
 // ── Database setup ────────────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  max: 20,                  // max simultaneous DB connections
+  idleTimeoutMillis: 30000, // close idle connections after 30s
+  connectionTimeoutMillis: 3000, // fail fast if pool is exhausted
 });
+
+// Log pool errors so they don't crash the process silently
+pool.on('error', (err) => console.error('PG pool error:', err.message));
 
 async function initDB() {
   try {
@@ -52,6 +128,47 @@ async function initDB() {
         created_at   TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE UNIQUE INDEX IF NOT EXISTS picks_game_player_idx ON picks(game_code, player_name);
+
+      CREATE TABLE IF NOT EXISTS groups (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        host_user_id TEXT NOT NULL,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS group_members (
+        id          SERIAL PRIMARY KEY,
+        group_id    TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        user_id     TEXT,
+        guest_name  TEXT,
+        display_name TEXT NOT NULL,
+        role        TEXT NOT NULL DEFAULT 'member',
+        joined_at   TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(group_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS group_members_group_idx ON group_members(group_id);
+      CREATE INDEX IF NOT EXISTS group_members_user_idx ON group_members(user_id);
+
+      CREATE TABLE IF NOT EXISTS group_invites (
+        id          SERIAL PRIMARY KEY,
+        group_id    TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        code        TEXT UNIQUE NOT NULL,
+        expires_at  TIMESTAMPTZ NOT NULL,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS group_invites_code_idx ON group_invites(code);
+
+      CREATE TABLE IF NOT EXISTS game_members (
+        id          SERIAL PRIMARY KEY,
+        game_code   TEXT NOT NULL REFERENCES games(code) ON DELETE CASCADE,
+        group_id    TEXT REFERENCES groups(id),
+        user_id     TEXT,
+        guest_name  TEXT,
+        display_name TEXT NOT NULL,
+        assignment  TEXT,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS game_members_game_idx ON game_members(game_code);
     `);
     console.log('Database ready');
   } catch (err) {
@@ -70,18 +187,25 @@ function makeToken() {
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'Squares backend running', version: '2.1' }));
+app.get('/', (req, res) => res.json({ status: 'Squares backend running', version: '2.3-hardened' }));
 
 // ── ESPN Scores ───────────────────────────────────────────────────────────────
-app.get('/scores', async (req, res) => {
+app.get('/scores', rateLimit(60, 60 * 1000), async (req, res) => {
   const sport = req.query.sport || 'basketball/nba';
   const dates = req.query.dates || '';
   const allowed = ['basketball/nba','basketball/mens-college-basketball','football/nfl','football/college-football'];
   if (!allowed.includes(sport)) return res.status(400).json({ error: 'Sport not supported' });
+  const cacheKey = `scores:${sport}:${dates}`;
+  const cached = getCached(cacheKey);
+  if (cached) return res.json(cached);
+
   try {
     let url = `https://site.api.espn.com/apis/site/v2/sports/${sport}/scoreboard`;
     if (dates) url += `?dates=${dates}`;
-    const response = await fetch(url);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
     const data = await response.json();
     const games = (data.events || []).map(ev => {
       const comp = ev.competitions[0];
@@ -102,21 +226,31 @@ app.get('/scores', async (req, res) => {
         statusName: comp.status?.type?.name || '',
       };
     });
-    res.json({ games });
+    const result = { games };
+    setCache(cacheKey, result, SCORES_TTL);
+    res.json(result);
   } catch (err) {
+    if (err.name === 'AbortError') return res.status(504).json({ error: 'ESPN timeout' });
     res.status(500).json({ error: 'Failed to fetch scores' });
   }
 });
 
 // ── ESPN Play-by-Play ─────────────────────────────────────────────────────────
-app.get('/playbyplay', async (req, res) => {
+app.get('/playbyplay', rateLimit(60, 60 * 1000), async (req, res) => {
   const { gameId, sport } = req.query;
   if (!gameId) return res.status(400).json({ error: 'gameId required' });
   const allowedSports = ['basketball/nba','basketball/mens-college-basketball','football/nfl','football/college-football'];
   const safeSport = allowedSports.includes(sport) ? sport : 'basketball/mens-college-basketball';
+  const pbpKey = `pbp:${safeSport}:${gameId}`;
+  const cachedPbp = getCached(pbpKey);
+  if (cachedPbp) return res.json(cachedPbp);
+
   try {
     const url = `https://site.web.api.espn.com/apis/site/v2/sports/${safeSport}/summary?event=${gameId}`;
-    const response = await fetch(url);
+    const controller = new AbortController();
+    const pbpTimeout = setTimeout(() => controller.abort(), 8000);
+    const response = await fetch(url, { signal: controller.signal });
+    clearTimeout(pbpTimeout);
     const data = await response.json();
     const plays = (data.plays || []).map(p => ({
       id: p.id, text: p.text || '',
@@ -124,8 +258,11 @@ app.get('/playbyplay', async (req, res) => {
       clock: p.clock?.displayValue || '',
       homeScore: p.homeScore, awayScore: p.awayScore,
     }));
-    res.json({ plays });
+    const pbpResult = { plays };
+    setCache(pbpKey, pbpResult, PBP_TTL);
+    res.json(pbpResult);
   } catch (err) {
+    if (err.name === 'AbortError') return res.status(504).json({ error: 'ESPN timeout' });
     res.status(500).json({ error: 'Failed to fetch play-by-play' });
   }
 });
@@ -343,6 +480,184 @@ app.post('/games/:code/picks/claim', async (req, res) => {
     res.json({ ok: true, playerName: player.player_name });
   } catch (err) {
     res.status(500).json({ error: 'Failed to claim square' });
+  }
+});
+
+
+// ── Groups ────────────────────────────────────────────────────────────────────
+
+// Create a group
+app.post('/groups', async (req, res) => {
+  try {
+    const { name, hostUserId, displayName } = req.body;
+    if (!name || !hostUserId) return res.status(400).json({ error: 'name and hostUserId required' });
+    const id = makeCode();
+    await pool.query(
+      'INSERT INTO groups (id, name, host_user_id) VALUES ($1, $2, $3)',
+      [id, name, hostUserId]
+    );
+    // Add host as a member with role 'host'
+    await pool.query(
+      'INSERT INTO group_members (group_id, user_id, display_name, role) VALUES ($1, $2, $3, $4)',
+      [id, hostUserId, displayName || 'Host', 'host']
+    );
+    res.json({ id, name });
+  } catch (err) {
+    console.error('POST /groups error:', err.message);
+    res.status(500).json({ error: 'Failed to create group', detail: err.message });
+  }
+});
+
+// Get all groups for a user
+app.get('/groups', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const result = await pool.query(
+      `SELECT g.id, g.name, g.host_user_id, g.created_at,
+        (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) as member_count
+       FROM groups g
+       JOIN group_members gm ON gm.group_id = g.id
+       WHERE gm.user_id = $1
+       ORDER BY g.created_at DESC`,
+      [userId]
+    );
+    res.json({ groups: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get groups' });
+  }
+});
+
+// Get a single group with members
+app.get('/groups/:id', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const group = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+    if (!group.rows.length) return res.status(404).json({ error: 'Group not found' });
+    const members = await pool.query(
+      'SELECT * FROM group_members WHERE group_id = $1 ORDER BY role DESC, joined_at ASC',
+      [req.params.id]
+    );
+    const isHost = group.rows[0].host_user_id === userId;
+    res.json({ ...group.rows[0], members: members.rows, isHost });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get group' });
+  }
+});
+
+// Generate a new invite link (expires in 24 hours)
+app.post('/groups/:id/invite', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const group = await pool.query('SELECT * FROM groups WHERE id = $1', [req.params.id]);
+    if (!group.rows.length) return res.status(404).json({ error: 'Not found' });
+    if (group.rows[0].host_user_id !== userId) return res.status(403).json({ error: 'Not authorized' });
+    
+    // Invalidate old invites for this group
+    await pool.query('DELETE FROM group_invites WHERE group_id = $1', [req.params.id]);
+    
+    const code = makeCode() + makeCode().slice(0, 2); // 8 char code
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+    await pool.query(
+      'INSERT INTO group_invites (group_id, code, expires_at) VALUES ($1, $2, $3)',
+      [req.params.id, code, expiresAt]
+    );
+    res.json({ code, expiresAt });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create invite' });
+  }
+});
+
+// Join a group via invite code
+app.post('/groups/join', async (req, res) => {
+  try {
+    const { code, userId, displayName } = req.body;
+    if (!code || !displayName) return res.status(400).json({ error: 'code and displayName required' });
+    
+    // Check invite is valid and not expired
+    const invite = await pool.query(
+      'SELECT * FROM group_invites WHERE code = $1 AND expires_at > NOW()',
+      [code]
+    );
+    if (!invite.rows.length) return res.status(404).json({ error: 'Invite link expired or invalid' });
+    
+    const groupId = invite.rows[0].group_id;
+    
+    // Check if already a member
+    if (userId) {
+      const existing = await pool.query(
+        'SELECT id FROM group_members WHERE group_id = $1 AND user_id = $2',
+        [groupId, userId]
+      );
+      if (existing.rows.length) return res.json({ groupId, alreadyMember: true });
+    }
+    
+    await pool.query(
+      'INSERT INTO group_members (group_id, user_id, guest_name, display_name, role) VALUES ($1, $2, $3, $4, $5)',
+      [groupId, userId || null, userId ? null : displayName, displayName, 'member']
+    );
+    
+    res.json({ groupId, joined: true });
+  } catch (err) {
+    console.error('POST /groups/join error:', err.message);
+    res.status(500).json({ error: 'Failed to join group', detail: err.message });
+  }
+});
+
+// Remove a member from a group
+app.delete('/groups/:id/members/:memberId', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const group = await pool.query('SELECT host_user_id FROM groups WHERE id = $1', [req.params.id]);
+    if (!group.rows.length) return res.status(404).json({ error: 'Not found' });
+    if (group.rows[0].host_user_id !== userId) return res.status(403).json({ error: 'Not authorized' });
+    await pool.query('DELETE FROM group_members WHERE id = $1 AND group_id = $2', [req.params.memberId, req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to remove member' });
+  }
+});
+
+// Get games for a group member (their dashboard)
+app.get('/groups/:id/games', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    const result = await pool.query(
+      `SELECT g.type, g.code, g.data, g.updated_at, gm.assignment, gm.display_name
+       FROM game_members gm
+       JOIN games g ON g.code = gm.game_code
+       WHERE gm.group_id = $1 AND (gm.user_id = $2 OR $2 IS NULL)
+       ORDER BY g.updated_at DESC`,
+      [req.params.id, userId || null]
+    );
+    res.json({ games: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get group games' });
+  }
+});
+
+// Add members to a game
+app.post('/games/:code/members', async (req, res) => {
+  try {
+    const { hostToken, groupId, members } = req.body;
+    // Verify host
+    const game = await pool.query('SELECT host_token FROM games WHERE code = $1', [req.params.code]);
+    if (!game.rows.length) return res.status(404).json({ error: 'Game not found' });
+    if (game.rows[0].host_token !== hostToken) return res.status(403).json({ error: 'Not authorized' });
+    
+    // Insert each member
+    for (const m of members) {
+      await pool.query(
+        `INSERT INTO game_members (game_code, group_id, user_id, guest_name, display_name, assignment)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT DO NOTHING`,
+        [req.params.code, groupId, m.userId || null, m.guestName || null, m.displayName, m.assignment || null]
+      );
+    }
+    res.json({ ok: true, added: members.length });
+  } catch (err) {
+    console.error('POST /games/:code/members error:', err.message);
+    res.status(500).json({ error: 'Failed to add members' });
   }
 });
 
