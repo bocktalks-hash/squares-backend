@@ -37,20 +37,15 @@ async function initDB() {
     );
   `);
 
-  // Drop and recreate groups tables fresh to fix missing SERIAL sequences
+  // Safe CREATE IF NOT EXISTS — preserves data across deploys
   await pool.query(`
-    DROP TABLE IF EXISTS group_invites CASCADE;
-    DROP TABLE IF EXISTS group_members CASCADE;
-    DROP TABLE IF EXISTS groups CASCADE;
-  `);
-  await pool.query(`
-    CREATE TABLE groups (
+    CREATE TABLE IF NOT EXISTS groups (
       id           SERIAL PRIMARY KEY,
       name         TEXT NOT NULL,
       host_user_id TEXT NOT NULL,
       created_at   TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE TABLE group_members (
+    CREATE TABLE IF NOT EXISTS group_members (
       id           SERIAL PRIMARY KEY,
       group_id     INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
       user_id      TEXT,
@@ -58,7 +53,7 @@ async function initDB() {
       role         TEXT NOT NULL DEFAULT 'member',
       joined_at    TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE TABLE group_invites (
+    CREATE TABLE IF NOT EXISTS group_invites (
       code       TEXT PRIMARY KEY,
       group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
       created_by TEXT NOT NULL,
