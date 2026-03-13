@@ -54,6 +54,16 @@ pool.query(`
     expires_at TIMESTAMPTZ NOT NULL,
     used       BOOLEAN DEFAULT FALSE
   );
+  -- Fix tables that may have been created without SERIAL sequences
+  CREATE SEQUENCE IF NOT EXISTS groups_id_seq;
+  ALTER TABLE groups ALTER COLUMN id SET DEFAULT nextval('groups_id_seq');
+  ALTER SEQUENCE groups_id_seq OWNED BY groups.id;
+  SELECT setval('groups_id_seq', COALESCE((SELECT MAX(id) FROM groups), 0) + 1, false);
+
+  CREATE SEQUENCE IF NOT EXISTS group_members_id_seq;
+  ALTER TABLE group_members ALTER COLUMN id SET DEFAULT nextval('group_members_id_seq');
+  ALTER SEQUENCE group_members_id_seq OWNED BY group_members.id;
+  SELECT setval('group_members_id_seq', COALESCE((SELECT MAX(id) FROM group_members), 0) + 1, false);
 `).then(() => console.log('DB tables ready'))
   .catch(err => console.error('DB init error:', err.message));
 
