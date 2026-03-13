@@ -405,7 +405,6 @@ app.get('/groups/join/:code', async (req, res) => {
     );
     if (invite.rowCount === 0) return res.status(404).json({ error: 'Invite not found' });
     const inv = invite.rows[0];
-    if (inv.used) return res.status(410).json({ error: 'Invite already used' });
     if (new Date(inv.expires_at) < new Date()) return res.status(410).json({ error: 'Invite expired' });
     res.json({ groupId: inv.group_id, groupName: inv.group_name, expiresAt: inv.expires_at });
   } catch (err) {
@@ -414,27 +413,26 @@ app.get('/groups/join/:code', async (req, res) => {
   }
 });
 
-// POST /groups/join/:code — accept an invite and join
+// POST /groups/join/:code — accept an invite and join (multi-use link)
 app.post('/groups/join/:code', async (req, res) => {
   const { userId, displayName } = req.body;
   if (!displayName) return res.status(400).json({ error: 'displayName required' });
   try {
     const invite = await pool.query(
-      'SELECT * FROM group_invites WHERE code=$1',
+      'SELECT gi.*, g.name AS group_name FROM group_invites gi JOIN groups g ON g.id = gi.group_id WHERE gi.code=$1',
       [req.params.code]
     );
     if (invite.rowCount === 0) return res.status(404).json({ error: 'Invite not found' });
     const inv = invite.rows[0];
-    if (inv.used) return res.status(410).json({ error: 'Invite already used' });
     if (new Date(inv.expires_at) < new Date()) return res.status(410).json({ error: 'Invite expired' });
 
-    // Check not already a member
+    // Check not already a member (by userId if signed in, or by name if guest)
     if (userId) {
       const existing = await pool.query(
         'SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2',
         [inv.group_id, userId]
       );
-      if (existing.rowCount > 0) return res.json({ alreadyMember: true, groupId: inv.group_id });
+      if (existing.rowCount > 0) return res.json({ ok: true, alreadyMember: true, groupId: inv.group_id, groupName: inv.group_name });
     }
 
     await pool.query(
@@ -442,11 +440,8 @@ app.post('/groups/join/:code', async (req, res) => {
       [inv.group_id, userId || null, displayName.trim(), 'member']
     );
 
-    // Mark invite as used (single-use)
-    await pool.query('UPDATE group_invites SET used=TRUE WHERE code=$1', [req.params.code]);
-
-    const group = await pool.query('SELECT name FROM groups WHERE id=$1', [inv.group_id]);
-    res.json({ ok: true, groupId: inv.group_id, groupName: group.rows[0]?.name });
+    // Multi-use: do NOT mark invite as used — anyone with the link can join
+    res.json({ ok: true, groupId: inv.group_id, groupName: inv.group_name });
   } catch (err) {
     console.error('POST /groups/join/:code error:', err.message);
     res.status(500).json({ error: 'Could not join group' });
