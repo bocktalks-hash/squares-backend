@@ -15,57 +15,61 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
-pool.query(`
-  CREATE TABLE IF NOT EXISTS shared_games (
-    code        TEXT PRIMARY KEY,
-    type        TEXT NOT NULL DEFAULT 'squares',
-    host_token  TEXT NOT NULL,
-    data        JSONB NOT NULL,
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS challenges (
-    id           SERIAL PRIMARY KEY,
-    game_code    TEXT NOT NULL REFERENCES shared_games(code) ON DELETE CASCADE,
-    player_name  TEXT NOT NULL,
-    period_label TEXT NOT NULL,
-    message      TEXT,
-    status       TEXT NOT NULL DEFAULT 'pending',
-    created_at   TIMESTAMPTZ DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS groups (
-    id           SERIAL PRIMARY KEY,
-    name         TEXT NOT NULL,
-    host_user_id TEXT NOT NULL,
-    created_at   TIMESTAMPTZ DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS group_members (
-    id           SERIAL PRIMARY KEY,
-    group_id     INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    user_id      TEXT,
-    display_name TEXT NOT NULL,
-    role         TEXT NOT NULL DEFAULT 'member',
-    joined_at    TIMESTAMPTZ DEFAULT NOW()
-  );
-  CREATE TABLE IF NOT EXISTS group_invites (
-    code       TEXT PRIMARY KEY,
-    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    created_by TEXT NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    used       BOOLEAN DEFAULT FALSE
-  );
-  -- Fix tables that may have been created without SERIAL sequences
-  CREATE SEQUENCE IF NOT EXISTS groups_id_seq;
-  ALTER TABLE groups ALTER COLUMN id SET DEFAULT nextval('groups_id_seq');
-  ALTER SEQUENCE groups_id_seq OWNED BY groups.id;
-  SELECT setval('groups_id_seq', COALESCE((SELECT MAX(id) FROM groups), 0) + 1, false);
+// Run migrations sequentially
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shared_games (
+      code        TEXT PRIMARY KEY,
+      type        TEXT NOT NULL DEFAULT 'squares',
+      host_token  TEXT NOT NULL,
+      data        JSONB NOT NULL,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS challenges (
+      id           SERIAL PRIMARY KEY,
+      game_code    TEXT NOT NULL REFERENCES shared_games(code) ON DELETE CASCADE,
+      player_name  TEXT NOT NULL,
+      period_label TEXT NOT NULL,
+      message      TEXT,
+      status       TEXT NOT NULL DEFAULT 'pending',
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
 
-  CREATE SEQUENCE IF NOT EXISTS group_members_id_seq;
-  ALTER TABLE group_members ALTER COLUMN id SET DEFAULT nextval('group_members_id_seq');
-  ALTER SEQUENCE group_members_id_seq OWNED BY group_members.id;
-  SELECT setval('group_members_id_seq', COALESCE((SELECT MAX(id) FROM group_members), 0) + 1, false);
-`).then(() => console.log('DB tables ready'))
-  .catch(err => console.error('DB init error:', err.message));
+  // Drop and recreate groups tables fresh to fix missing SERIAL sequences
+  await pool.query(`
+    DROP TABLE IF EXISTS group_invites CASCADE;
+    DROP TABLE IF EXISTS group_members CASCADE;
+    DROP TABLE IF EXISTS groups CASCADE;
+  `);
+  await pool.query(`
+    CREATE TABLE groups (
+      id           SERIAL PRIMARY KEY,
+      name         TEXT NOT NULL,
+      host_user_id TEXT NOT NULL,
+      created_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE group_members (
+      id           SERIAL PRIMARY KEY,
+      group_id     INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+      user_id      TEXT,
+      display_name TEXT NOT NULL,
+      role         TEXT NOT NULL DEFAULT 'member',
+      joined_at    TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE group_invites (
+      code       TEXT PRIMARY KEY,
+      group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+      created_by TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used       BOOLEAN DEFAULT FALSE
+    );
+  `);
+  console.log('DB tables ready');
+}
+
+initDB().catch(err => console.error('DB init error:', err.message));
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function makeCode(len = 6) {
