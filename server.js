@@ -23,6 +23,7 @@ async function initDB() {
       type        TEXT NOT NULL DEFAULT 'squares',
       host_token  TEXT NOT NULL,
       data        JSONB NOT NULL,
+      group_id    INTEGER REFERENCES groups(id) ON DELETE SET NULL,
       created_at  TIMESTAMPTZ DEFAULT NOW(),
       updated_at  TIMESTAMPTZ DEFAULT NOW()
     );
@@ -61,6 +62,10 @@ async function initDB() {
       used       BOOLEAN DEFAULT FALSE
     );
   `);
+  // Add group_id to shared_games if missing (migration for existing DBs)
+  await pool.query(`
+    ALTER TABLE shared_games ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL;
+  `).catch(() => {});
   console.log('DB tables ready');
 }
 
@@ -197,7 +202,7 @@ app.get('/game', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 app.post('/games', async (req, res) => {
-  const { type, data } = req.body;
+  const { type, data, groupId } = req.body;
   if (!data) return res.status(400).json({ error: 'data is required' });
   let code, attempts = 0;
   while (attempts < 10) {
@@ -209,8 +214,8 @@ app.post('/games', async (req, res) => {
   const hostToken = makeCode(16) + makeCode(16);
   try {
     await pool.query(
-      'INSERT INTO shared_games (code, type, host_token, data) VALUES ($1,$2,$3,$4)',
-      [code, type || 'squares', hostToken, JSON.stringify(data)]
+      'INSERT INTO shared_games (code, type, host_token, data, group_id) VALUES ($1,$2,$3,$4,$5)',
+      [code, type || 'squares', hostToken, JSON.stringify(data), groupId || null]
     );
     res.json({ code, hostToken });
   } catch (err) {
@@ -440,6 +445,31 @@ app.post('/groups/join/:code', async (req, res) => {
   } catch (err) {
     console.error('POST /groups/join/:code error:', err.message);
     res.status(500).json({ error: 'Could not join group' });
+  }
+});
+
+// GET /groups/:id/games — list all shared games for a group
+app.get('/groups/:id/games', async (req, res) => {
+  const { userId } = req.query;
+  try {
+    // Verify user is a member of this group
+    if (userId) {
+      const member = await pool.query(
+        'SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2',
+        [req.params.id, userId]
+      );
+      if (member.rowCount === 0) return res.status(403).json({ error: 'Not a member' });
+    }
+    const result = await pool.query(
+      `SELECT code, type, data->>'teamA' as team_a, data->>'teamB' as team_b,
+              data->>'tabName' as tab_name, group_id, created_at, updated_at
+       FROM shared_games WHERE group_id=$1 ORDER BY updated_at DESC`,
+      [req.params.id]
+    );
+    res.json({ games: result.rows });
+  } catch (err) {
+    console.error('GET /groups/:id/games error:', err.message);
+    res.status(500).json({ error: 'Could not fetch games' });
   }
 });
 
