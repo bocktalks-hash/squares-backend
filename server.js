@@ -435,10 +435,23 @@ app.get('/groups/:id', async (req, res) => {
     if (group.rowCount === 0) return res.status(404).json({ error: 'Group not found' });
     const g = group.rows[0];
 
-    // Check membership if userId provided
+    // Allow access if: user is the host, OR user is in group_members
     if (userId) {
-      const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', [g.id, userId]);
-      if (mem.rowCount === 0) return res.status(403).json({ error: 'Not a member of this group' });
+      const isHost = g.host_user_id === userId;
+      if (!isHost) {
+        const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', [g.id, userId]);
+        if (mem.rowCount === 0) return res.status(403).json({ error: 'Not a member of this group' });
+      }
+      // If host isn't in group_members yet, auto-add them
+      if (isHost) {
+        const hostMember = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', [g.id, userId]);
+        if (hostMember.rowCount === 0) {
+          await pool.query(
+            'INSERT INTO group_members (group_id, user_id, display_name, role) VALUES ($1,$2,$3,$4)',
+            [g.id, userId, 'Host', 'host']
+          ).catch(() => {});
+        }
+      }
     }
 
     const members = await pool.query(
