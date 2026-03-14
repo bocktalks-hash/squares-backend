@@ -66,6 +66,17 @@ async function initDB() {
   await pool.query(`
     ALTER TABLE shared_games ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL;
   `).catch(() => {});
+
+  // User cloud sync table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_data (
+      user_id     TEXT PRIMARY KEY,
+      squares     JSONB NOT NULL DEFAULT '[]',
+      timeout     JSONB NOT NULL DEFAULT '[]',
+      roster      JSONB NOT NULL DEFAULT '[]',
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
   console.log('DB tables ready');
 }
 
@@ -498,6 +509,36 @@ app.delete('/groups/:id/members/:memberId', async (req, res) => {
   } catch (err) {
     console.error('DELETE /groups member error:', err.message);
     res.status(500).json({ error: 'Could not remove member' });
+  }
+});
+
+// GET /userdata/:userId — load user's synced game data
+app.get('/userdata/:userId', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM user_data WHERE user_id=$1', [req.params.userId]);
+    if (result.rowCount === 0) return res.json({ squares: [], timeout: [], roster: [] });
+    const row = result.rows[0];
+    res.json({ squares: row.squares || [], timeout: row.timeout || [], roster: row.roster || [] });
+  } catch (err) {
+    console.error('GET /userdata error:', err.message);
+    res.status(500).json({ error: 'Could not load user data' });
+  }
+});
+
+// PUT /userdata/:userId — save user's synced game data
+app.put('/userdata/:userId', async (req, res) => {
+  const { squares, timeout, roster } = req.body;
+  try {
+    await pool.query(`
+      INSERT INTO user_data (user_id, squares, timeout, roster, updated_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (user_id) DO UPDATE
+      SET squares=$2, timeout=$3, roster=$4, updated_at=NOW()
+    `, [req.params.userId, JSON.stringify(squares || []), JSON.stringify(timeout || []), JSON.stringify(roster || [])]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('PUT /userdata error:', err.message);
+    res.status(500).json({ error: 'Could not save user data' });
   }
 });
 
