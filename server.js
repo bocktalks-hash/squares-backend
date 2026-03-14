@@ -351,51 +351,6 @@ app.post('/groups', async (req, res) => {
 });
 
 // GET /groups/:id?userId=xxx — get group detail with members
-app.get('/groups/:id', async (req, res) => {
-  const { userId } = req.query;
-  try {
-    const group = await pool.query('SELECT * FROM groups WHERE id=$1', [req.params.id]);
-    if (group.rowCount === 0) return res.status(404).json({ error: 'Group not found' });
-    const g = group.rows[0];
-
-    // Check membership if userId provided
-    if (userId) {
-      const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', [g.id, userId]);
-      if (mem.rowCount === 0) return res.status(403).json({ error: 'Not a member of this group' });
-    }
-
-    const members = await pool.query(
-      'SELECT * FROM group_members WHERE group_id=$1 ORDER BY joined_at ASC',
-      [g.id]
-    );
-    res.json({ ...g, members: members.rows });
-  } catch (err) {
-    console.error('GET /groups/:id error:', err.message);
-    res.status(500).json({ error: 'Could not fetch group' });
-  }
-});
-
-// POST /groups/:id/invite — generate an invite link (host only)
-app.post('/groups/:id/invite', async (req, res) => {
-  const { userId } = req.body;
-  if (!userId) return res.status(400).json({ error: 'userId required' });
-  try {
-    const group = await pool.query('SELECT * FROM groups WHERE id=$1 AND host_user_id=$2', [req.params.id, userId]);
-    if (group.rowCount === 0) return res.status(403).json({ error: 'Not the host of this group' });
-
-    const code = makeCode(8);
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-    await pool.query(
-      'INSERT INTO group_invites (code, group_id, created_by, expires_at) VALUES ($1,$2,$3,$4)',
-      [code, req.params.id, userId, expiresAt]
-    );
-    res.json({ code, expiresAt });
-  } catch (err) {
-    console.error('POST /groups/:id/invite error:', err.message);
-    res.status(500).json({ error: 'Could not create invite' });
-  }
-});
-
 // GET /groups/join/:code — look up an invite (before joining)
 app.get('/groups/join/:code', async (req, res) => {
   try {
@@ -470,6 +425,51 @@ app.get('/groups/:id/games', async (req, res) => {
   } catch (err) {
     console.error('GET /groups/:id/games error:', err.message);
     res.status(500).json({ error: 'Could not fetch games' });
+  }
+});
+
+app.get('/groups/:id', async (req, res) => {
+  const { userId } = req.query;
+  try {
+    const group = await pool.query('SELECT * FROM groups WHERE id=$1', [req.params.id]);
+    if (group.rowCount === 0) return res.status(404).json({ error: 'Group not found' });
+    const g = group.rows[0];
+
+    // Check membership if userId provided
+    if (userId) {
+      const mem = await pool.query('SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2', [g.id, userId]);
+      if (mem.rowCount === 0) return res.status(403).json({ error: 'Not a member of this group' });
+    }
+
+    const members = await pool.query(
+      'SELECT * FROM group_members WHERE group_id=$1 ORDER BY joined_at ASC',
+      [g.id]
+    );
+    res.json({ ...g, members: members.rows });
+  } catch (err) {
+    console.error('GET /groups/:id error:', err.message);
+    res.status(500).json({ error: 'Could not fetch group' });
+  }
+});
+
+// POST /groups/:id/invite — generate an invite link (host only)
+app.post('/groups/:id/invite', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  try {
+    const group = await pool.query('SELECT * FROM groups WHERE id=$1 AND host_user_id=$2', [req.params.id, userId]);
+    if (group.rowCount === 0) return res.status(403).json({ error: 'Not the host of this group' });
+
+    const code = makeCode(8);
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+    await pool.query(
+      'INSERT INTO group_invites (code, group_id, created_by, expires_at) VALUES ($1,$2,$3,$4)',
+      [code, req.params.id, userId, expiresAt]
+    );
+    res.json({ code, expiresAt });
+  } catch (err) {
+    console.error('POST /groups/:id/invite error:', err.message);
+    res.status(500).json({ error: 'Could not create invite' });
   }
 });
 
