@@ -150,7 +150,8 @@ app.get('/playbyplay', async (req, res) => {
     const plays = [], tvTimeouts = [];
     (data.plays || []).forEach(play => {
       const text = (play.text || '').toLowerCase();
-      const isTimeout = text.includes('official tv timeout') || text.includes('tv timeout');
+      // Only match the specific "Official TV Timeout" string — not team timeouts or 20-second timeouts
+      const isTimeout = text.includes('official tv timeout');
       const entry = {
         id: play.id, period: play.period?.number || 0,
         clock: play.clock?.displayValue || '', text: play.text || '',
